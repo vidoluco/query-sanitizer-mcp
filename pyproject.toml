@@ -1,0 +1,15 @@
+[project]
+name = "query-sanitizer-mcp"
+version = "0.1.0"
+description = "MCP middleware that sanitizes prompts via a local model before they reach external LLMs"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+]
+
+[project.scripts]
+query-sanitizer-mcp = "server:mcp.run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
