@@ -87,7 +87,7 @@ def _call_local_model(text: str) -> dict:
             {"role": "user", "content": text},
         ],
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
+        "enable_thinking": False,
     }).encode()
 
     req = urllib.request.Request(
@@ -96,11 +96,16 @@ def _call_local_model(text: str) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         body = json.loads(resp.read())
 
-    content = body["choices"][0]["message"]["content"]
-    return json.loads(content)
+    content = body["choices"][0]["message"]["content"].strip()
+    # strip markdown code fences if present
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content.strip())
 
 
 def _load_config() -> dict:
