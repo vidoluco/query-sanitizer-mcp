@@ -1,10 +1,31 @@
 [project]
 name = "query-sanitizer-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "MCP middleware that sanitizes prompts via a local model before they reach external LLMs"
 requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0",
+]
+
+[project.optional-dependencies]
+# NER layer — adds GLiNER for people/org/location detection on top of regex
+# Works on M4 (MPS) and Colab T4 (CUDA) with no extra config
+nlp = [
+    "gliner>=0.2.0",
+]
+# Full Colab stack — GLiNER + HuggingFace transformers backend (no Ollama needed)
+colab = [
+    "gliner>=0.2.0",
+    "transformers>=4.40.0",
+    "torch>=2.0.0",
+    "accelerate>=0.27.0",
+]
+# Development
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
 ]
 
 [project.scripts]
@@ -13,3 +34,10 @@ query-sanitizer-mcp = "server:mcp.run"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
