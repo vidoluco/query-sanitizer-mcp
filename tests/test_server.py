@@ -390,5 +390,115 @@ class TestViewLedger(unittest.TestCase):
         self.assertIn("Ver", result)
 
 
+class TestGlinerScan(unittest.TestCase):
+    """GLiNER tests use a mock model — no download required."""
+
+    def setUp(self):
+        self._td = tempfile.mkdtemp()
+        server.LEDGER_DIR = Path(self._td)
+        server.LEDGER_FILE = Path(self._td) / "ledger.jsonl"
+
+    def _mock_gliner_entities(self, entities):
+        """Return a mock GLiNER instance whose predict_entities returns `entities`."""
+        mock_model = unittest.mock.MagicMock()
+        mock_model.predict_entities.return_value = entities
+        return mock_model
+
+    def test_gliner_unavailable_returns_unchanged(self):
+        orig = server.GLINER_AVAILABLE
+        try:
+            server.GLINER_AVAILABLE = False
+            text = "Alice Smith works at Acme Corp"
+            result, mappings = server._gliner_scan(text, {}, {})
+            self.assertEqual(result, text)
+            self.assertEqual(mappings, [])
+        finally:
+            server.GLINER_AVAILABLE = orig
+
+    def test_gliner_catches_person(self):
+        entities = [{"start": 0, "end": 11, "text": "Alice Smith", "label": "person", "score": 0.92}]
+        with patch("server._get_gliner", return_value=self._mock_gliner_entities(entities)):
+            server.GLINER_AVAILABLE = True
+            text = "Alice Smith approved the change"
+            redacted, mappings = server._gliner_scan(text, {}, {})
+        server.GLINER_AVAILABLE = False
+        self.assertNotIn("Alice Smith", redacted)
+        self.assertEqual(mappings[0]["category"], "PII_NAME")
+        self.assertEqual(mappings[0]["source"], "gliner")
+
+    def test_gliner_always_allow_respected(self):
+        entities = [{"start": 0, "end": 10, "text": "Kubernetes", "label": "organization", "score": 0.85}]
+        config = {"always_allow": ["Kubernetes"]}
+        with patch("server._get_gliner", return_value=self._mock_gliner_entities(entities)):
+            server.GLINER_AVAILABLE = True
+            text = "Kubernetes runs our cluster"
+            redacted, mappings = server._gliner_scan(text, config, {})
+        server.GLINER_AVAILABLE = False
+        self.assertIn("Kubernetes", redacted)
+        self.assertEqual(mappings, [])
+
+    def test_gliner_placeholder_not_reclassified(self):
+        # [PII_NAME_1] from Phase 1 should not be re-detected by GLiNER
+        entities = [{"start": 0, "end": 11, "text": "[PII_NAME_1]", "label": "person", "score": 0.88}]
+        with patch("server._get_gliner", return_value=self._mock_gliner_entities(entities)):
+            server.GLINER_AVAILABLE = True
+            text = "[PII_NAME_1] approved the change"
+            redacted, mappings = server._gliner_scan(text, {}, {"PII_NAME": 1})
+        server.GLINER_AVAILABLE = False
+        self.assertEqual(redacted, text)  # placeholder left intact
+        self.assertEqual(mappings, [])
+
+    def test_gliner_counter_offset_avoids_collision(self):
+        # Regex already used PII_NAME_1; GLiNER should start at PII_NAME_2
+        entities = [{"start": 0, "end": 10, "text": "Bob Wilson", "label": "person", "score": 0.90}]
+        with patch("server._get_gliner", return_value=self._mock_gliner_entities(entities)):
+            server.GLINER_AVAILABLE = True
+            _, mappings = server._gliner_scan("Bob Wilson did something", {}, {"PII_NAME": 1})
+        server.GLINER_AVAILABLE = False
+        self.assertEqual(mappings[0]["placeholder"], "[PII_NAME_2]")
+
+    def test_gliner_exception_returns_unchanged(self):
+        mock_model = unittest.mock.MagicMock()
+        mock_model.predict_entities.side_effect = RuntimeError("model error")
+        with patch("server._get_gliner", return_value=mock_model):
+            server.GLINER_AVAILABLE = True
+            text = "Some text here"
+            redacted, mappings = server._gliner_scan(text, {}, {})
+        server.GLINER_AVAILABLE = False
+        self.assertEqual(redacted, text)
+        self.assertEqual(mappings, [])
+
+    def test_gliner_integrated_into_sanitize_query(self):
+        entities = [{"start": 0, "end": 9, "text": "Jane Doe", "label": "person", "score": 0.91}]
+        mock_llm = _mock_llm("Hello [PII_NAME_1]", [])
+        mock_gliner = self._mock_gliner_entities(entities)
+        with patch("server._call_local_model", return_value=mock_llm), \
+             patch("server._get_gliner", return_value=mock_gliner), \
+             patch.object(server, "GLINER_AVAILABLE", True):
+            result = server.sanitize_query("Jane Doe approved")
+        self.assertIn("[PII_NAME", result)
+        self.assertNotIn("Jane Doe", result.split("sanitized_text:")[-1])
+
+
+class TestHFBackend(unittest.TestCase):
+
+    def test_call_hf_model_no_pipeline_raises(self):
+        orig = server._hf_pipeline
+        try:
+            server._hf_pipeline = None
+            server._HF_PIPE = None
+            with self.assertRaises(RuntimeError):
+                server._call_hf_model("text", "prompt")
+        finally:
+            server._hf_pipeline = orig
+
+    def test_sanitizer_backend_env(self):
+        # Default backend should be "ollama" in test env
+        self.assertEqual(server.SANITIZER_BACKEND, "ollama")
+
+
+import unittest.mock  # needed for MagicMock in GLiNER tests
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

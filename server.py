@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Query Sanitizer MCP Middleware — v0.2.0
+Query Sanitizer MCP Middleware — v0.3.0
 
-Pipeline: regex pre-pass  →  LLM refinement  →  post-scan confidence check
-Fail-safe: if local model unavailable, falls back to regex-only (never passes original text).
+Pipeline: regex pre-pass → GLiNER NER → LLM refinement → post-scan confidence check
+Fail-safe: on LLM failure, falls back to regex + GLiNER (never passes original text).
 
 Tools:
   sanitize_query(text)            → redacted text + san_id
   restore_response(text, san_id)  → original values rehydrated
   scan_response(text)             → scan LLM output for data leakage
   view_ledger(last_n)             → recent sanitization history
+
+Backends (set SANITIZER_BACKEND):
+  ollama (default) — Ollama 0.19+ with MLX on M4, or standard llama.cpp
+  hf               — HuggingFace transformers (Google Colab / no-Ollama setups)
 """
 
 import json
@@ -28,15 +32,95 @@ from fastmcp import FastMCP
 # Config
 # ---------------------------------------------------------------------------
 
-LOCAL_MODEL_URL = os.getenv("SANITIZER_MODEL_URL", "http://localhost:11434/v1/chat/completions")
-LOCAL_MODEL_NAME = os.getenv("SANITIZER_MODEL_NAME", "llama3.2")
-LEDGER_DIR = Path(os.getenv("SANITIZER_LEDGER_DIR", ".sanitizer-ledger"))
-LEDGER_FILE = LEDGER_DIR / "ledger.jsonl"
-CONFIG_FILE = LEDGER_DIR / "config.json"
-STORE_ORIGINALS = os.getenv("SANITIZER_LEDGER_STORE_ORIGINALS", "true").lower() == "true"
-MODEL_RETRIES = int(os.getenv("SANITIZER_MODEL_RETRIES", "2"))
+LOCAL_MODEL_URL  = os.getenv("SANITIZER_MODEL_URL",  "http://localhost:11434/v1/chat/completions")
+LOCAL_MODEL_NAME = os.getenv("SANITIZER_MODEL_NAME", "qwen2.5:3b")
+LEDGER_DIR       = Path(os.getenv("SANITIZER_LEDGER_DIR", ".sanitizer-ledger"))
+LEDGER_FILE      = LEDGER_DIR / "ledger.jsonl"
+CONFIG_FILE      = LEDGER_DIR / "config.json"
+STORE_ORIGINALS  = os.getenv("SANITIZER_LEDGER_STORE_ORIGINALS", "true").lower() == "true"
+MODEL_RETRIES    = int(os.getenv("SANITIZER_MODEL_RETRIES", "2"))
+SANITIZER_BACKEND = os.getenv("SANITIZER_BACKEND", "ollama")  # "ollama" | "hf"
+HF_MODEL_ID      = os.getenv("SANITIZER_HF_MODEL",    "Qwen/Qwen2.5-3B-Instruct")
+GLINER_MODEL_ID  = os.getenv("SANITIZER_GLINER_MODEL", "urchade/gliner_medium-v2.1")
+GLINER_THRESHOLD = float(os.getenv("SANITIZER_GLINER_THRESHOLD", "0.4"))
 
 SCHEMA_VERSION = 1
+
+# ---------------------------------------------------------------------------
+# GLiNER — Phase 1b NER layer (optional; pip install "gliner>=0.2")
+# ---------------------------------------------------------------------------
+GLINER_AVAILABLE = False
+_GLINER_INSTANCE = None
+
+try:
+    from gliner import GLiNER as _GLiNERClass
+    GLINER_AVAILABLE = True
+except ImportError:
+    pass
+
+# GLiNER zero-shot labels → our DLP categories (None = skip)
+_GLINER_LABEL_MAP: dict[str, str | None] = {
+    "person":                 "PII_NAME",
+    "email address":          "PII_NAME",
+    "phone number":           "PII_NAME",
+    "organization":           "ORG_NAME",
+    "company":                "ORG_NAME",
+    "location":               "GEO_INTERNAL",
+    "address":                "GEO_INTERNAL",
+    "url":                    "INTERNAL_URL",
+    "ip address":             "INFRA",
+    "hostname":               "INFRA",
+    "database":               "INFRA",
+    "social security number": "PII_ID",
+    "credit card number":     "PII_ID",
+    "passport number":        "PII_ID",
+    "employee id":            "PII_ID",
+    "api key":                "CREDENTIAL",
+    "password":               "CREDENTIAL",
+    "secret key":             "CREDENTIAL",
+    "token":                  "CREDENTIAL",
+    "money":                  "FINANCIAL",
+    "revenue":                "FINANCIAL",
+    "contract":               "LEGAL",
+    "case number":            "LEGAL",
+    "project name":           "PROJECT_NAME",
+    "codename":               "PROJECT_NAME",
+    "date":                   None,
+    "time":                   None,
+}
+
+def _get_gliner():
+    global _GLINER_INSTANCE
+    if _GLINER_INSTANCE is None:
+        _GLINER_INSTANCE = _GLiNERClass.from_pretrained(GLINER_MODEL_ID)
+    return _GLINER_INSTANCE
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace transformers backend — for Colab / no-Ollama setups
+# (pip install "transformers>=4.40" torch accelerate)
+# ---------------------------------------------------------------------------
+_HF_PIPE = None
+_hf_pipeline = None
+
+if SANITIZER_BACKEND == "hf":
+    try:
+        from transformers import pipeline as _hf_pipeline_import  # type: ignore
+        _hf_pipeline = _hf_pipeline_import
+    except ImportError:
+        SANITIZER_BACKEND = "ollama"  # fall back silently
+
+
+def _get_hf_pipe():
+    global _HF_PIPE
+    if _HF_PIPE is None and _hf_pipeline is not None:
+        _HF_PIPE = _hf_pipeline(
+            "text-generation",
+            model=HF_MODEL_ID,
+            device_map="auto",
+            torch_dtype="auto",
+        )
+    return _HF_PIPE
 
 # ---------------------------------------------------------------------------
 # Regex patterns — deterministic pre-pass layer
@@ -253,7 +337,97 @@ def _postscan_check(sanitized_text: str) -> list[dict]:
     return misses
 
 
+def _gliner_scan(text: str, config: dict, cat_counts: dict[str, int]) -> tuple[str, list]:
+    """
+    GLiNER NER pass — catches named entities regex can't (people, orgs, locations).
+    Runs on already-regex-redacted text so placeholders from Phase 1 are preserved.
+    cat_counts is the per-category counter from Phase 1 to avoid placeholder collisions.
+    """
+    if not GLINER_AVAILABLE:
+        return text, []
+
+    always_allow_lower = {v.lower() for v in config.get("always_allow", [])}
+    labels = [lbl for lbl, cat in _GLINER_LABEL_MAP.items() if cat is not None]
+
+    try:
+        entities = _get_gliner().predict_entities(text, labels, threshold=GLINER_THRESHOLD)
+    except Exception:
+        return text, []
+
+    seen: dict[str, str] = {}
+    counts = dict(cat_counts)
+    covered = bytearray(len(text))
+    raw: list[tuple[int, int, str, str, str, float, bool]] = []
+
+    for ent in sorted(entities, key=lambda x: x["start"]):
+        start, end = ent["start"], ent["end"]
+        if any(covered[start:end]):
+            continue
+        original = ent["text"]
+        category = _GLINER_LABEL_MAP.get(ent["label"])
+        if not category:
+            continue
+        if original.lower() in always_allow_lower:
+            continue
+        # Skip existing placeholders from Phase 1 (e.g. [PII_NAME_1])
+        if _PLACEHOLDER_RE.match(original):
+            continue
+        covered[start:end] = b"\x01" * (end - start)
+        key = original.lower()
+        blocked = category == "CREDENTIAL"
+        if key not in seen:
+            if blocked:
+                seen[key] = "[CREDENTIAL_REDACTED]"
+            else:
+                n = counts.get(category, 0) + 1
+                counts[category] = n
+                seen[key] = f"[{category}_{n}]"
+        raw.append((start, end, original, seen[key], category, round(ent["score"], 2), blocked))
+
+    chars = list(text)
+    for start, end, _, placeholder, _, _, _ in sorted(raw, key=lambda x: -x[0]):
+        chars[start:end] = list(placeholder)
+    redacted = "".join(chars)
+
+    seen_keys: set[str] = set()
+    mappings: list[dict] = []
+    for _, _, original, placeholder, category, confidence, blocked in sorted(raw, key=lambda x: x[0]):
+        key = original.lower()
+        if key not in seen_keys:
+            seen_keys.add(key)
+            mappings.append({
+                "placeholder": placeholder,
+                "original": "[BLOCKED]" if blocked else original,
+                "category": category,
+                "confidence": confidence,
+                "blocked": blocked,
+                "source": "gliner",
+            })
+    return redacted, mappings
+
+
+def _call_hf_model(text: str, system_prompt: str) -> dict:
+    """HuggingFace transformers backend — for Colab / no-Ollama setups."""
+    pipe = _get_hf_pipe()
+    if pipe is None:
+        raise RuntimeError("HuggingFace pipeline not available (transformers not installed)")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": text},
+    ]
+    output = pipe(messages, max_new_tokens=2048, do_sample=False)
+    content = output[0]["generated_text"][-1]["content"].strip()
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content.strip())
+
+
 def _call_local_model(text: str, system_prompt: str) -> dict:
+    if SANITIZER_BACKEND == "hf":
+        return _call_hf_model(text, system_prompt)
+
     payload = json.dumps({
         "model": LOCAL_MODEL_NAME,
         "messages": [
@@ -368,8 +542,23 @@ def sanitize_query(text: str) -> str:
     """
     config = _load_config()
 
-    # Phase 1 — always runs, deterministic, zero external calls
+    # Phase 1 — regex (always runs, deterministic, zero external calls)
     pre_text, pre_mappings = _regex_prescan(text, config)
+
+    # Phase 1b — GLiNER NER (if installed; catches people, orgs, locations regex misses)
+    cat_counts: dict[str, int] = {}
+    for m in pre_mappings:
+        if not m.get("blocked"):
+            try:
+                n = int(m["placeholder"].rstrip("]").rsplit("_", 1)[1])
+                cat_counts[m["category"]] = max(cat_counts.get(m["category"], 0), n)
+            except (ValueError, IndexError):
+                pass
+    gliner_text, gliner_mappings = _gliner_scan(pre_text, config, cat_counts)
+    if gliner_mappings:
+        pre_text = gliner_text
+        pre_mappings = pre_mappings + gliner_mappings
+
     pre_placeholders = {m["placeholder"] for m in pre_mappings}
 
     # Phase 2 — LLM refinement (best-effort; pre_text is the safe fallback)
@@ -476,6 +665,20 @@ def scan_response(response_text: str) -> str:
     """
     config = _load_config()
     pre_text, pre_mappings = _regex_prescan(response_text, config)
+
+    cat_counts: dict[str, int] = {}
+    for m in pre_mappings:
+        if not m.get("blocked"):
+            try:
+                n = int(m["placeholder"].rstrip("]").rsplit("_", 1)[1])
+                cat_counts[m["category"]] = max(cat_counts.get(m["category"], 0), n)
+            except (ValueError, IndexError):
+                pass
+    gliner_text, gliner_mappings = _gliner_scan(pre_text, config, cat_counts)
+    if gliner_mappings:
+        pre_text = gliner_text
+        pre_mappings = pre_mappings + gliner_mappings
+
     pre_ph = {m["placeholder"] for m in pre_mappings}
 
     llm_mappings: list[dict] = []

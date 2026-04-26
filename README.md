@@ -6,8 +6,8 @@ A lightweight MCP middleware that sits between your prompts and external LLMs, a
 [Your Prompt] → sanitize_query() → [Safe Prompt] → External LLM → [Response] → restore_response() → [You]
 ```
 
-**v0.2.0** — Three-phase DLP pipeline: regex pre-pass → LLM refinement → post-scan confidence check.
-Fail-safe: if the local model is offline, falls back to regex-only. The original text is **never** passed through on failure.
+**v0.3.0** — Four-phase DLP pipeline: regex → GLiNER NER → LLM refinement → post-scan check.
+Runs 100% open-source, 100% local. Tested on **M4 MacBook** and **Google Colab T4**.
 
 ---
 
@@ -74,28 +74,24 @@ LLM misses (e.g. a JWT the model didn't catch). Shown as a warning in the report
 
 ## Setup
 
-**Requirements:** Python 3.10+, Ollama or LM Studio running locally.
+### Option A — M4 MacBook (recommended)
+
+**Stack:** Ollama 0.19+ (MLX backend, ~50 tok/s on M4) + GLiNER NER (MPS, ~80ms/call)
 
 ```bash
+# 1. Install Ollama and pull the recommended model
+brew install ollama
+ollama pull qwen2.5:3b   # 2GB, fast + strong instruction following
+ollama serve             # Ollama 0.19+ uses MLX automatically on Apple Silicon
+
+# 2. Clone and install with NER layer
 git clone https://github.com/vidoluco/query-sanitizer-mcp
 cd query-sanitizer-mcp
 python3 -m venv .venv
-.venv/bin/pip install "fastmcp>=2.0"
+.venv/bin/pip install -e ".[nlp]"   # fastmcp + gliner (GLiNER NER layer)
 ```
 
-### Start your local model
-
-```bash
-# Ollama
-ollama pull llama3.2
-ollama serve
-
-# LM Studio — load a model and start the local server on port 1234
-```
-
-### Add to Claude Code
-
-Merge into `~/.claude/settings.json`:
+**Add to Claude Code** (`~/.claude/settings.json`):
 
 ```json
 {
@@ -104,13 +100,64 @@ Merge into `~/.claude/settings.json`:
       "command": "/path/to/query-sanitizer-mcp/.venv/bin/python",
       "args": ["/path/to/query-sanitizer-mcp/server.py"],
       "env": {
-        "SANITIZER_MODEL_URL": "http://localhost:11434/v1/chat/completions",
-        "SANITIZER_MODEL_NAME": "llama3.2"
+        "SANITIZER_MODEL_NAME": "qwen2.5:3b",
+        "SANITIZER_GLINER_MODEL": "urchade/gliner_medium-v2.1"
       }
     }
   }
 }
 ```
+
+**Alternative LLM models for M4 (all via Ollama):**
+
+| Model | Size | Speed on M4 | Best for |
+|---|---|---|---|
+| `qwen2.5:3b` | 2 GB | ~50 tok/s | Default — fast, accurate |
+| `phi4-mini` | 3 GB | ~40 tok/s | Strong reasoning |
+| `llama3.2:3b` | 2 GB | ~45 tok/s | Broad general use |
+| `qwen2.5:7b` | 5 GB | ~30 tok/s | Higher accuracy, more RAM |
+
+---
+
+### Option B — Google Colab T4
+
+**Stack:** HuggingFace transformers (no Ollama needed) + GLiNER (CUDA)
+
+```python
+# Cell 1 — install
+!pip install "query-sanitizer-mcp[colab]" -q
+# fastmcp + gliner + transformers + torch + accelerate
+
+# Cell 2 — configure
+import os
+os.environ["SANITIZER_BACKEND"]    = "hf"
+os.environ["SANITIZER_HF_MODEL"]   = "Qwen/Qwen2.5-3B-Instruct"  # ~6GB, fits T4 16GB
+os.environ["SANITIZER_GLINER_MODEL"] = "urchade/gliner_medium-v2.1"
+os.environ["SANITIZER_LEDGER_DIR"] = "/content/sanitizer-ledger"
+
+# Cell 3 — use directly (no MCP client needed in Colab)
+import sys; sys.path.insert(0, ".")
+from server import sanitize_query, restore_response, scan_response
+
+result = sanitize_query("Send report to jane.doe@acme.com re: Project Phoenix")
+print(result)
+```
+
+> First run downloads `Qwen2.5-3B-Instruct` (~6 GB) and `gliner_medium-v2.1` (~500 MB) to the Colab cache. Subsequent runs are instant.
+
+---
+
+### Minimum setup (regex-only, no models needed)
+
+If you want zero-dependency operation (pure regex, no Ollama, no GLiNER):
+
+```bash
+pip install fastmcp
+SANITIZER_MODEL_RETRIES=0 python server.py
+```
+
+Credentials, emails, SSNs, private IPs and financial amounts are caught by regex alone.
+People, org names, and project codenames require GLiNER or the LLM layer.
 
 ---
 
