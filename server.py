@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Query Sanitizer MCP Middleware — v0.3.0
+Query Sanitizer MCP Middleware — v0.3.1
 
 Pipeline: regex pre-pass → GLiNER NER → LLM refinement → post-scan confidence check
 Fail-safe: on LLM failure, falls back to regex + GLiNER (never passes original text).
@@ -42,7 +42,9 @@ MODEL_RETRIES    = int(os.getenv("SANITIZER_MODEL_RETRIES", "2"))
 SANITIZER_BACKEND = os.getenv("SANITIZER_BACKEND", "ollama")  # "ollama" | "hf"
 HF_MODEL_ID      = os.getenv("SANITIZER_HF_MODEL",    "Qwen/Qwen2.5-3B-Instruct")
 GLINER_MODEL_ID  = os.getenv("SANITIZER_GLINER_MODEL", "urchade/gliner_medium-v2.1")
-GLINER_THRESHOLD = float(os.getenv("SANITIZER_GLINER_THRESHOLD", "0.4"))
+GLINER_THRESHOLD  = float(os.getenv("SANITIZER_GLINER_THRESHOLD",   "0.4"))
+HF_DTYPE          = os.getenv("SANITIZER_HF_DTYPE",         "auto")
+SESSION_CACHE_MAX = int(os.getenv("SANITIZER_SESSION_CACHE_MAX",    "500"))
 
 SCHEMA_VERSION = 1
 
@@ -118,7 +120,7 @@ def _get_hf_pipe():
             "text-generation",
             model=HF_MODEL_ID,
             device_map="auto",
-            torch_dtype="auto",
+            torch_dtype=HF_DTYPE,
         )
     return _HF_PIPE
 
@@ -210,6 +212,15 @@ If nothing sensitive is found, return:
 # ---------------------------------------------------------------------------
 
 _SESSION_CACHE: dict[str, list] = {}
+
+
+def _cache_put(san_id: str, mappings: list) -> None:
+    """Write to session cache; evict oldest entries (FIFO) when over SESSION_CACHE_MAX."""
+    _SESSION_CACHE[san_id] = mappings
+    if SESSION_CACHE_MAX > 0 and len(_SESSION_CACHE) > SESSION_CACHE_MAX:
+        excess = len(_SESSION_CACHE) - SESSION_CACHE_MAX
+        for key in list(_SESSION_CACHE.keys())[:excess]:
+            del _SESSION_CACHE[key]
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +589,7 @@ def sanitize_query(text: str) -> str:
     merged = pre_mappings + llm_mappings
     san_id = _san_id()
     entry = _build_ledger_entry(san_id, merged)
-    _SESSION_CACHE[san_id] = merged  # full originals in memory regardless of STORE_ORIGINALS
+    _cache_put(san_id, merged)  # full originals in memory regardless of STORE_ORIGINALS
     _write_ledger(entry)
 
     # Phase 3 — post-scan

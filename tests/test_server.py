@@ -250,6 +250,32 @@ class TestSanitizeQuery(unittest.TestCase):
             result = server.sanitize_query("Tell me about Python")
         self.assertIn("no sensitive data detected", result)
 
+    def test_session_cache_pruned_at_max(self):
+        orig_max = server.SESSION_CACHE_MAX
+        try:
+            server.SESSION_CACHE_MAX = 3
+            server._SESSION_CACHE.clear()
+            mock = _mock_llm("text", [])
+            with patch("server._call_local_model", return_value=mock):
+                for _ in range(5):
+                    server.sanitize_query("text")
+            self.assertLessEqual(len(server._SESSION_CACHE), 3)
+        finally:
+            server.SESSION_CACHE_MAX = orig_max
+
+    def test_session_cache_max_zero_disables_pruning(self):
+        orig_max = server.SESSION_CACHE_MAX
+        try:
+            server.SESSION_CACHE_MAX = 0
+            server._SESSION_CACHE.clear()
+            mock = _mock_llm("text", [])
+            with patch("server._call_local_model", return_value=mock):
+                for _ in range(8):
+                    server.sanitize_query("text")
+            self.assertEqual(len(server._SESSION_CACHE), 8)
+        finally:
+            server.SESSION_CACHE_MAX = orig_max
+
     def test_session_cache_populated(self):
         mock = _mock_llm("Hello [ORG_NAME_1]", [
             {"placeholder": "[ORG_NAME_1]", "original": "Acme", "category": "ORG_NAME", "confidence": 0.9, "blocked": False}
