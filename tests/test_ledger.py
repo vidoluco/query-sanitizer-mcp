@@ -25,10 +25,12 @@ class LedgerTestBase(unittest.TestCase):
         ledger.CONFIG_FILE = ledger.LEDGER_DIR / "config.json"
 
     def _write_entry(self, san_id: str, mappings: list, blocked: int = 0) -> None:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         entry = {
             "schema_version": 1,
             "id": san_id,
-            "timestamp": "2026-04-01T10:00:00Z",
+            "timestamp": now,
             "direction": "outbound",
             "token_count": len(mappings),
             "mappings": mappings,

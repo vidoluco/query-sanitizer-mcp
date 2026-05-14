@@ -7,7 +7,7 @@ A lightweight MCP middleware that sits between your prompts and external LLMs, a
 ```
 
 **v0.3.0** — Four-phase DLP pipeline: regex → GLiNER NER → LLM refinement → post-scan check.
-Runs 100% open-source, 100% local. Tested on **M4 MacBook** and **Google Colab T4**.
+Runs 100% open-source, 100% local. Tested on **M4 MacBook**, **Google Colab T4**, and **Windows 8GB PC**.
 
 ---
 
@@ -147,6 +147,65 @@ print(result)
 
 ---
 
+### Option C — Windows 8GB PC
+
+**Download Ollama for Windows:** [ollama.com/download/windows](https://ollama.com/download/windows)
+
+#### Memory tiers — pick what fits your machine
+
+| Tier | Stack | RAM used | Recommendation |
+|---|---|---|---|
+| A — Regex only | `fastmcp`, no models | ~150 MB | Always works, zero setup |
+| B — GLiNER small + qwen2.5:1.5b | `[lightweight]` + Ollama | ~2.5 GB | **Recommended for 8 GB** |
+| C — GLiNER medium + qwen2.5:3b | `[nlp]` + Ollama | ~5.5–6 GB | Highest accuracy — monitor RAM |
+
+> Tier C uses ~70% of 8 GB. With Chrome + VS Code open you may hit the ceiling — use Tier B.
+
+#### Tier B setup (recommended for 8 GB)
+
+```cmd
+git clone https://github.com/vidoluco/query-sanitizer-mcp
+cd query-sanitizer-mcp
+setup.bat
+```
+
+`setup.bat` creates a `.venv`, installs `fastmcp`, optionally installs GLiNER, and writes
+`config_hint.txt` with a ready-to-paste Claude Code config block.
+
+**Claude Code config** (`%APPDATA%\Claude\settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "query-sanitizer": {
+      "command": "C:\\path\\to\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\query-sanitizer-mcp\\server.py"],
+      "env": {
+        "SANITIZER_MODEL_NAME": "qwen2.5:1.5b",
+        "SANITIZER_GLINER_MODEL": "urchade/gliner_small-v2.1",
+        "SANITIZER_SESSION_CACHE_MAX": "200"
+      }
+    }
+  }
+}
+```
+
+#### Tier C (tight fit, highest accuracy)
+
+Same as M4 setup but add `SANITIZER_SESSION_CACHE_MAX=100` to cap RAM growth:
+
+```json
+{
+  "env": {
+    "SANITIZER_MODEL_NAME": "qwen2.5:3b",
+    "SANITIZER_GLINER_MODEL": "urchade/gliner_medium-v2.1",
+    "SANITIZER_SESSION_CACHE_MAX": "100"
+  }
+}
+```
+
+---
+
 ### Minimum setup (regex-only, no models needed)
 
 If you want zero-dependency operation (pure regex, no Ollama, no GLiNER):
@@ -194,6 +253,8 @@ variants). Changes take effect on the next `sanitize_query` call — no server r
 | `SANITIZER_MODEL_RETRIES` | `2` | Retries on model failure (2s, 4s backoff) |
 | `SANITIZER_LEDGER_DIR` | `.sanitizer-ledger/` | Ledger directory path |
 | `SANITIZER_LEDGER_STORE_ORIGINALS` | `true` | Set to `false` to stop storing original values at rest (GDPR mode — restore only works within the same session) |
+| `SANITIZER_HF_DTYPE` | `auto` | HF pipeline dtype. `float16` halves LLM RAM on the HF backend. **Warning:** CPU float16 may fail on some Windows torch builds — test before setting. |
+| `SANITIZER_SESSION_CACHE_MAX` | `500` | Max in-memory session cache entries (FIFO eviction). Evicted entries fall back to ledger. Set `0` to disable. Reduce to `100–200` on 8 GB machines. |
 
 ---
 

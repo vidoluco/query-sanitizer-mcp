@@ -1,6 +1,6 @@
 [project]
 name = "query-sanitizer-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP middleware that sanitizes prompts via a local model before they reach external LLMs"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,6 +12,12 @@ dependencies = [
 # Works on M4 (MPS) and Colab T4 (CUDA) with no extra config
 nlp = [
     "gliner>=0.2.0",
+]
+# Windows 8GB / memory-constrained — GLiNER small (~800MB RAM) + fastmcp
+# Switch model with: SANITIZER_GLINER_MODEL=urchade/gliner_small-v2.1
+lightweight = [
+    "gliner>=0.2.0",
+    "fastmcp>=2.0",
 ]
 # Full Colab stack — GLiNER + HuggingFace transformers backend (no Ollama needed)
 colab = [
